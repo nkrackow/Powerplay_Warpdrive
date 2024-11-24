@@ -1,46 +1,273 @@
 #![no_std]
 #![cfg_attr(not(doc), no_main)]
 
+use bxcan::Frame;
+use core::cmp::Ordering;
+
+use heapless::binary_heap::{BinaryHeap, Max};
+
+use stm32f1xx_hal::pac::Interrupt;
+
+#[derive(Debug)]
+pub struct PriorityFrame(Frame);
+
+/// Ordering is based on the Identifier and frame type (data vs. remote) and can be used to sort
+/// frames by priority.
+impl Ord for PriorityFrame {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.priority().cmp(&other.0.priority())
+    }
+}
+
+impl PartialOrd for PriorityFrame {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PriorityFrame {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for PriorityFrame {}
+
+fn enqueue_frame(queue: &mut BinaryHeap<PriorityFrame, Max, 16>, frame: Frame) {
+    queue.push(PriorityFrame(frame)).unwrap();
+    rtic::pend(Interrupt::USB_HP_CAN_TX);
+}
+
 #[rtic::app(device = stm32f1xx_hal::pac)]
 mod app {
+    use super::{enqueue_frame, PriorityFrame};
+    use bxcan::{filter::Mask32, ExtendedId, Fifo, Frame, Interrupts, Rx0, StandardId, Tx};
+    use heapless::binary_heap::{BinaryHeap, Max};
+    use nb::block;
     use panic_rtt_target as _;
     use rtt_target::{rprintln, rtt_init_print};
-    use cortex_m_rt::entry;
-    use nb::block;
+    use stm32f1xx_hal::{can::Can, pac::CAN1, prelude::*, prelude::*, timer::Timer};
     use stm32f1xx_hal::{
         gpio::{gpioa::PA0, gpioc::PC13, Edge, ExtiPin, Input, Output, PullDown, PushPull},
         prelude::*,
     };
-    use stm32f1xx_hal::{pac, prelude::*, timer::Timer};
-
-    #[shared]
-    struct Shared {}
 
     #[local]
-    struct Local {}
+    struct Local {
+        can_tx: Tx<Can<CAN1>>,
+        can_rx: Rx0<Can<CAN1>>,
+    }
+    #[shared]
+    struct Shared {
+        can_tx_queue: BinaryHeap<PriorityFrame, Max, 16>,
+        tx_count: usize,
+    }
 
     #[init]
-    fn init(mut ctx: init::Context) -> (Shared, Local, init::Monotonics) {
+    fn init(mut cx: init::Context) -> (Shared, Local, init::Monotonics) {
         rtt_init_print!();
         rprintln!("Hello, Rust!");
 
-        let mut flash = ctx.device.FLASH.constrain();
-        let rcc = ctx.device.RCC.constrain();
+        let mut flash = cx.device.FLASH.constrain();
+        let rcc = cx.device.RCC.constrain();
 
-        let clocks = rcc.cfgr.freeze(&mut flash.acr);
+        let _clocks = rcc
+            .cfgr
+            .use_hse(8.MHz())
+            .sysclk(64.MHz())
+            .hclk(64.MHz())
+            .pclk1(16.MHz())
+            .pclk2(64.MHz())
+            .freeze(&mut flash.acr);
 
-        let mut timer = Timer::syst(ctx.core.SYST, &clocks).counter_hz();
-        timer.start(1.Hz()).unwrap();
+        let can1 = Can::new(cx.device.CAN1);
+        let can2 = Can::new(cx.device.CAN2);
 
-        let mut i = 0;
+        let mut gpioa = cx.device.GPIOA.split();
+        let mut gpiob = cx.device.GPIOB.split();
+        let can1_rx_pin = gpioa.pa11.into_floating_input(&mut gpioa.crh);
+        let can1_tx_pin = gpioa.pa12.into_alternate_push_pull(&mut gpioa.crh);
+        let can2_rx_pin = gpiob.pb5.into_floating_input(&mut gpiob.crl);
+        let can2_tx_pin = gpiob.pb6.into_alternate_push_pull(&mut gpiob.crl);
+        let mut afio = cx.device.AFIO.constrain();
+        can1.assign_pins((can1_tx_pin, can1_rx_pin), &mut afio.mapr);
+        can2.assign_pins((can2_tx_pin, can2_rx_pin), &mut afio.mapr);
+
+        // APB1 (PCLK1): 16MHz, Bit rate: 1000kBit/s, Sample Point 87.5%
+        let mut can1 = bxcan::Can::builder(can1)
+            .set_bit_timing(0x001c_0000)
+            .leave_disabled();
+
+        can1.modify_filters()
+            .enable_bank(0, Fifo::Fifo0, Mask32::accept_all());
+
+        can1.enable_interrupts(
+            Interrupts::TRANSMIT_MAILBOX_EMPTY | Interrupts::FIFO0_MESSAGE_PENDING,
+        );
+        nb::block!(can1.enable_non_blocking()).unwrap();
+
+        // APB1 (PCLK1): 16MHz, Bit rate: 1000kBit/s, Sample Point 87.5%
+        let mut can2 = bxcan::Can::builder(can2)
+            .set_bit_timing(0x001c_0000)
+            .leave_disabled();
+
+        // can2.modify_filters()
+        //     .enable_bank(0, Fifo::Fifo0, Mask32::accept_all());
+
+        can2.enable_interrupts(
+            Interrupts::TRANSMIT_MAILBOX_EMPTY | Interrupts::FIFO0_MESSAGE_PENDING,
+        );
+        nb::block!(can2.enable_non_blocking()).unwrap();
+
+        rprintln!("CANs initialized");
+
+        let (can_tx, can_rx, _) = can1.split();
+
+        let can_tx_queue = BinaryHeap::new();
+
+        (
+            Shared {
+                can_tx_queue,
+                tx_count: 0,
+            },
+            Local { can_tx, can_rx },
+            init::Monotonics(),
+        )
+    }
+
+    #[idle(shared = [can_tx_queue, tx_count])]
+    fn idle(mut cx: idle::Context) -> ! {
+        let mut tx_queue = cx.shared.can_tx_queue;
+        rprintln!("1");
+
+        // Enqueue some messages. Higher ID means lower priority.
+        tx_queue.lock(|mut tx_queue| {
+            enqueue_frame(
+                &mut tx_queue,
+                Frame::new_data(StandardId::new(9).unwrap(), []),
+            );
+            enqueue_frame(
+                &mut tx_queue,
+                Frame::new_data(ExtendedId::new(9).unwrap(), []),
+            );
+            rprintln!("2");
+
+            enqueue_frame(
+                &mut tx_queue,
+                Frame::new_data(StandardId::new(8).unwrap(), []),
+            );
+            enqueue_frame(
+                &mut tx_queue,
+                Frame::new_data(ExtendedId::new(8).unwrap(), []),
+            );
+
+            enqueue_frame(
+                &mut tx_queue,
+                Frame::new_data(StandardId::new(0x7FF).unwrap(), []),
+            );
+            enqueue_frame(
+                &mut tx_queue,
+                Frame::new_data(ExtendedId::new(0x1FFF_FFFF).unwrap(), []),
+            );
+        });
+        rprintln!("3");
+
+        // Add some higher priority messages when 3 messages have been sent.
         loop {
-            block!(timer.wait()).unwrap();
-            i += 1;
-            rprintln!("Hello again; I have blinked {} times.", i);
-            if i == 10 {
-                panic!("Yow, 10 times is enough!");
+            let tx_count = cx.shared.tx_count.lock(|tx_count| *tx_count);
+
+            if tx_count >= 3 {
+                tx_queue.lock(|mut tx_queue| {
+                    enqueue_frame(
+                        &mut tx_queue,
+                        Frame::new_data(StandardId::new(3).unwrap(), []),
+                    );
+                    enqueue_frame(
+                        &mut tx_queue,
+                        Frame::new_data(StandardId::new(2).unwrap(), []),
+                    );
+                    enqueue_frame(
+                        &mut tx_queue,
+                        Frame::new_data(StandardId::new(1).unwrap(), []),
+                    );
+                });
+                break;
             }
         }
-        (Shared {}, Local {}, init::Monotonics())
+
+        rprintln!("done enqueuing something?");
+
+        // Expected bus traffic:
+        //
+        // 1. ID: 0x00000008  <- proper reordering happens
+        // 2. ID: 0x00000009
+        // 3. ID: 0x008
+        // 4. ID: 0x001       <- higher priority messages injected correctly
+        // 5. ID: 0x002
+        // 6. ID: 0x003
+        // 7. ID: 0x009
+        // 8. ID: 0x7FF
+        // 9. ID: 0x1FFFFFFF
+        //
+        // The output can look different if there are other nodes on bus the sending messages.
+
+        loop {
+            cortex_m::asm::nop();
+        }
+    }
+
+    // This ISR is triggered by each finished frame transmission.
+    #[task(binds = USB_HP_CAN_TX, local = [can_tx], shared = [can_tx_queue, tx_count])]
+    fn can_tx(cx: can_tx::Context) {
+        let tx = cx.local.can_tx;
+        let mut tx_queue = cx.shared.can_tx_queue;
+        let mut tx_count = cx.shared.tx_count;
+        rprintln!("CAN TX!");
+
+        tx.clear_interrupt_flags();
+
+        // There is now a free mailbox. Try to transmit pending frames until either
+        // the queue is empty or transmission would block the execution of this ISR.
+        (&mut tx_queue, &mut tx_count).lock(|tx_queue, tx_count| {
+            while let Some(frame) = tx_queue.peek() {
+                match tx.transmit(&frame.0) {
+                    Ok(status) => match status.dequeued_frame() {
+                        None => {
+                            // Frame was successfully placed into a transmit buffer.
+                            tx_queue.pop();
+                            rprintln!("TX Count: {}", tx_queue.len());
+                            *tx_count += 1;
+                        }
+                        Some(pending_frame) => {
+                            // A lower priority frame was replaced with our high priority frame.
+                            // Put the low priority frame back in the transmit queue.
+                            tx_queue.pop();
+                            rprintln!("fail, put back");
+                            enqueue_frame(tx_queue, pending_frame.clone());
+                        }
+                    },
+                    Err(nb::Error::WouldBlock) => break,
+                    Err(_) => unreachable!(),
+                }
+            }
+        });
+        rprintln!("CAN TX IRS done");
+    }
+
+    #[task(binds = USB_LP_CAN_RX0, local = [can_rx], shared = [can_tx_queue])]
+    fn can_rx0(mut cx: can_rx0::Context) {
+        // Echo back received packages with correct priority ordering.
+        rprintln!("CAN RX!");
+        loop {
+            match cx.local.can_rx.receive() {
+                Ok(frame) => {
+                    cx.shared.can_tx_queue.lock(|can_tx_queue| {
+                        enqueue_frame(can_tx_queue, frame);
+                    });
+                }
+                Err(nb::Error::WouldBlock) => break,
+                Err(nb::Error::Other(_)) => {} // Ignore overrun errors.
+            }
+        }
     }
 }
